@@ -74,7 +74,7 @@ function getNextLevelPoints(level) {
 
 // --- Funktionalitet for Discord Events ---
 
-client.on('ready', () => {
+client.on('clientReady', () => {
     loadLevelData(); // Indlæs data, når botten er klar
     console.log(`✅ Logget ind som ${client.user.tag}!`);
     registerSlashCommands();
