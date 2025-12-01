@@ -1,244 +1,347 @@
-const { Client, GatewayIntentBits, Collection, REST, Routes, EmbedBuilder } = require('discord.js');
-const dotenv = require('dotenv');
+const { 
+    Client, GatewayIntentBits, Collection, REST, Routes,
+    EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle 
+} = require('discord.js');
 const fs = require('fs');
+const dotenv = require('dotenv');
 
+// --- SETUP ---
+console.log('✅ Loading environment variables...');
 dotenv.config();
 
-// Hent tokenet
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const CLIENT_ID = '1438203144306823229';
+// NOTE: These IDs are hardcoded as per your request, but are ideally loaded from .env.
+const CLIENT_ID = '1438203144306823229'; 
+const GUILD_ID = '1438918054796070913';
+const PENDING_ROLE = '1438944157522595971';
+const MEMBER_ROLE = '1438944177084956783';
+const REVIEW_CHANNEL = '1438940778448683118';
 
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.GuildMembers,
         GatewayIntentBits.MessageContent,
-    ],
+        GatewayIntentBits.DirectMessages
+    ]
 });
 
-const DATA_FILE = './leveldata.json';
-let levelData = {};
-const POINTS_PER_MESSAGE = 1;
-const COOLDOWN_MS = 10000;
-const GUILD_ID = '1438918054796070913';
+client.commands = new Collection();
 
-function loadLevelData() {
+const DATA_FILE = './applications.json';
+let applications = {};
+
+// --- UTILITY FUNCTIONS ---
+
+function loadApplications() {
+    console.log(`⏳ Attempting to load application data from ${DATA_FILE}...`);
     if (fs.existsSync(DATA_FILE)) {
-        try {
-            const data = fs.readFileSync(DATA_FILE, 'utf8');
-            levelData = JSON.parse(data);
-            console.log(`Leveldata indlæst fra ${DATA_FILE}`);
-        } catch (error) {
-            console.error('Fejl ved indlæsning af leveldata:', error);
-            levelData = {};
-        }
+        applications = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+        console.log(`✅ Application data loaded. Found ${Object.keys(applications).length} existing applications.`);
     } else {
-        console.log('Leveldatafil ikke fundet, starter med tom data.');
-        levelData = {};
+        console.log(`⚠️ Data file ${DATA_FILE} not found. Starting with empty application list.`);
     }
 }
 
-function saveLevelData() {
+function saveApplications() {
+    console.log('🔄 Saving application data to disk...');
+    fs.writeFileSync(DATA_FILE, JSON.stringify(applications, null, 2));
+    console.log('✅ Application data saved successfully.');
+}
+
+function loadCommands() {
+    console.log('⏳ Loading bot commands...');
+    const commandFiles = fs.readdirSync('./commands').filter(f => f.endsWith('.js'));
+    console.log(`Found ${commandFiles.length} command file(s).`);
+
+    for (const file of commandFiles) {
+        const command = require(`./commands/${file}`);
+        client.commands.set(command.data.name, command);
+        console.log(`-> Loaded command: /${command.data.name}`);
+    }
+    console.log('✅ All commands loaded into collection.');
+}
+
+async function registerSlashCommands() {
+    console.log('⏳ Registering slash commands with Discord...');
+    const rest = new REST({ version: '10' }).setToken(BOT_TOKEN);
+    const body = client.commands.map(cmd => cmd.data);
+
     try {
-        fs.writeFileSync(DATA_FILE, JSON.stringify(levelData, null, 2), 'utf8');
+        await rest.put(
+            Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID),
+            { body }
+        );
+        console.log(`✅ Successfully registered ${body.length} application commands for GUILD_ID: ${GUILD_ID}`);
     } catch (error) {
-        console.error('Fejl ved gemme leveldata:', error);
+        console.error('❌ ERROR during slash command registration:', error);
     }
 }
 
-/**
- * @param {number} level Det level, man går fra (f.eks. for at nå level 1 skal man have 10 point.
- * @returns {number} Antal nødvendige point.
- */
+// ---------------- APPLICATION FLOW ----------------
 
-function getNextLevelPoints(level) {
-    if (level === 0) return 10;
-    return 10 * Math.pow(2, level);
+async function startApplication(member) {
+    console.log(`--- NEW APPLICATION: User ${member.user.tag} (${member.id}) initiated application.`);
+
+    const questions = {
+        elev: [
+            'Hvad er dit navn? Skriv "anonym" hvis du vil skjule det.',
+            'Indtast dit elevnummer (5 cifre).',
+            'Hvor gammel er du? Eller skriv "anonym".'
+        ],
+        lærer: [
+            'Hvad er dit navn? Skriv "anonym" hvis du vil skjule det.',
+            'Hvor gammel er du? Eller skriv "anonym".'
+        ]
+    };
+
+    let roleType = null;
+    const answers = {};
+    let step = 0;
+    let year = null;
+
+    const dm = await member.send('Velkommen! Du skal besvare nogle spørgsmål for at få adgang.').catch(() => {
+        console.log(`⚠️ Could not send DM to ${member.user.tag}. They might have DMs disabled.`);
+        return null;
+    });
+    if (!dm) return;
+    console.log(`Sent initial welcome message to ${member.user.tag}'s DMs.`);
+    
+    await member.send('Er du **lærer** eller **elev**? Svar kun "lærer" eller "elev".');
+
+    const collector = dm.channel.createMessageCollector({ time: 600000 });
+    console.log('Message collector started in DM channel.');
+
+    collector.on('collect', async msg => {
+        if (msg.author.id !== member.id) return;
+        const content = msg.content.trim();
+        console.log(`-> Collector received message from ${member.user.tag}: "${content}" (Step: ${step}, RoleType: ${roleType})`);
+
+        if (!roleType) {
+            if (content !== 'elev' && content !== 'lærer') {
+                console.log('-> Invalid role type response.');
+                return member.send('Svar skal være "lærer" eller "elev".');
+            }
+            roleType = content;
+            console.log(`-> Role type set to: ${roleType}. Moving to first question.`);
+            return member.send(questions[roleType][step]);
+        }
+        
+        // --- Elevated logging for step-by-step processing ---
+
+        if (roleType === 'elev') {
+            if (step === 0) {
+                answers.name = content;
+                step++;
+                console.log(`-> ELEV Step 0 (Name) complete. Asking Q${step}.`);
+                return member.send(questions.elev[step]);
+            }
+
+            if (step === 1) {
+                if (!/^\d{5}$/.test(content)) {
+                    console.log('-> ELEV Step 1 (Elevnummer) FAILED validation: not 5 digits.');
+                    return member.send('Elevnummer skal være præcis 5 cifre.');
+                }
+                year = parseInt(content.slice(0, 2));
+                const now = new Date().getFullYear() % 100;
+
+                if (year < 20 || year > now) {
+                     console.log(`-> ELEV Step 1 (Elevnummer) FAILED validation: Invalid year prefix (${year}).`);
+                     return member.send('Ugyldigt elevnummer.');
+                }
+
+                answers.elevnummer = content;
+                step++;
+                console.log(`-> ELEV Step 1 (Elevnummer) complete. Asking Q${step}. Year extracted: 20${year}`);
+                return member.send(questions.elev[step]);
+            }
+
+            if (step === 2) {
+                answers.age = content;
+                console.log('-> ELEV Step 2 (Age) complete. Application finished.');
+                collector.stop('done');
+            }
+        }
+
+        if (roleType === 'lærer') {
+            if (step === 0) {
+                answers.name = content;
+                step++;
+                console.log(`-> LÆRER Step 0 (Name) complete. Asking Q${step}.`);
+                return member.send(questions.lærer[step]);
+            }
+
+            if (step === 1) {
+                answers.age = content;
+                answers.elevnummer = null;
+                console.log('-> LÆRER Step 1 (Age) complete. Application finished.');
+                collector.stop('done');
+            }
+        }
+    });
+
+    collector.on('end', async (_, reason) => {
+        console.log(`--- Application collector ended. Reason: ${reason}`);
+
+        if (reason !== 'done') {
+            console.log(`Application for ${member.user.tag} stopped due to reason: ${reason}.`);
+            return;
+        }
+
+        applications[member.id] = {
+            role: roleType,
+            name: answers.name,
+            elevnummer: answers.elevnummer,
+            age: answers.age,
+            timestamp: Date.now()
+        };
+        saveApplications();
+        console.log(`Saved application data for ${member.user.tag} (Role: ${roleType}).`);
+
+        const channel = member.guild.channels.cache.get(REVIEW_CHANNEL);
+
+        // --- ELEV: auto accept ---
+        if (roleType === 'elev') {
+            console.log('Processing ELEV application: Auto-approving.');
+            
+            if (channel) {
+                const yearPrefix = answers.elevnummer ? answers.elevnummer.slice(0, 2) : 'XX';
+                const embed = new EmbedBuilder()
+                    .setTitle(`✅ Ny elev: ${member.user.tag} (Auto-godkendt)`)
+                    .addFields(
+                        { name: 'Navn', value: answers.name },
+                        { name: 'Elevnummer', value: `Har gået på skolen siden 20${yearPrefix}` },
+                        { name: 'Alder', value: answers.age }
+                    );
+                channel.send({ embeds: [embed] });
+                console.log(`Sent auto-approved ELEV notice to REVIEW_CHANNEL (${REVIEW_CHANNEL}).`);
+            }
+
+            await member.roles.remove(PENDING_ROLE).catch(e => console.error('❌ Failed to remove PENDING_ROLE:', e.message));
+            await member.roles.add(MEMBER_ROLE).catch(e => console.error('❌ Failed to add MEMBER_ROLE:', e.message));
+            await member.send('Du er automatisk godkendt som elev. Velkommen!').catch(e => console.error('❌ Failed to send final DM:', e.message));
+            
+            console.log(`✅ ELEV ${member.user.tag} is approved and roles updated.`);
+            return;
+        }
+
+        // --- LÆRER: send review ---
+        if (roleType === 'lærer') {
+            console.log('Processing LÆRER application: Sending for manual review.');
+            
+            if (channel) {
+                const embed = new EmbedBuilder()
+                    .setTitle(`⚠️ Ny lærer-ansøgning: ${member.user.tag} (Manual Review)`)
+                    .addFields(
+                        { name: 'Navn', value: answers.name },
+                        { name: 'Elevnummer', value: 'Ingen' },
+                        { name: 'Alder', value: answers.age }
+                    );
+
+                const row = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId(`approve_${member.id}`).setLabel('Godkend').setStyle(ButtonStyle.Success),
+                    new ButtonBuilder().setCustomId(`deny_${member.id}`).setLabel('Afvis').setStyle(ButtonStyle.Danger)
+                );
+
+                channel.send({ embeds: [embed], components: [row] });
+                console.log(`Sent LÆRER application for ${member.user.tag} to REVIEW_CHANNEL.`);
+            }
+
+            await member.send('Tak for dine svar! En lærer skal godkende dig.').catch(e => console.error('❌ Failed to send final DM:', e.message));
+        }
+    });
 }
 
+// Make startApplication available to commands
+client.startApplication = startApplication;
 
-client.on('clientReady', () => {
-    loadLevelData();
-    console.log(`✅ Logget ind som ${client.user.tag}!`);
+// ---------------- EVENTS ----------------
+
+client.on('ready', () => {
+    console.log('----------------------------------------------------');
+    console.log(`🤖 Bot is logged in as ${client.user.tag}! (ID: ${client.user.id})`);
+    console.log('----------------------------------------------------');
+    loadApplications();
+    loadCommands();
     registerSlashCommands();
 });
 
-client.on('messageCreate', async message => {
-    if (message.author.bot || !message.guild) return;
-
-    const userId = message.author.id;
-    const now = Date.now();
-
-    if (!levelData[userId]) {
-        levelData[userId] = { points: 0, level: 0, lastMessage: 0 };
+client.on('guildMemberAdd', async member => {
+    console.log(`\n🔔 EVENT: guildMemberAdd for ${member.user.tag} (${member.id})`);
+    if (member.user.bot) {
+        console.log('-> User is a bot. Ignoring.');
+        return;
     }
-
-    const userData = levelData[userId];
-
-    if (now - userData.lastMessage < COOLDOWN_MS) {
+    if (applications[member.id]) {
+        console.log('-> User already has an existing application record. Ignoring new application process.');
         return;
     }
 
-    userData.points += POINTS_PER_MESSAGE;
-    userData.lastMessage = now;
-
-    const requiredPoints = getNextLevelPoints(userData.level);
-
-    if (userData.points >= requiredPoints) {
-        userData.level += 1;
-        
-        console.log(`🎉 ${message.author.tag} har nået Level ${userData.level}!`);
-        message.channel.send(`**Tillykke, ${message.author}!** Du har nået **Level ${userData.level}**! 🚀`);
-        
-        await handleLevelRole(message.member, userData.level);
-    }
-    
-    saveLevelData();
+    await member.roles.add(PENDING_ROLE).catch(e => console.error(`❌ Failed to assign PENDING_ROLE (${PENDING_ROLE}):`, e.message));
+    console.log(`-> Assigned PENDING_ROLE to ${member.user.tag}.`);
+    startApplication(member);
 });
 
-/**
- * @param {GuildMember} member Brugeren, der har nået level.
- * @param {number} level Det niveau, brugeren har nået.
- */
-
-async function handleLevelRole(member, level) {
-    const guild = member.guild;
-    const roleName = `Level ${level}`;
-    
-    let role = guild.roles.cache.find(r => r.name === roleName);
-
-    if (!role) {
-        try {
-            role = await guild.roles.create({
-                name: roleName,
-                color: 'Random',
-                reason: `Level-up til Level ${level}`,
-                mentionable: true,
-            });
-            console.log(`Rolle "${roleName}" oprettet.`);
-        } catch (error) {
-            console.error(`Fejl ved oprettelse af rolle ${roleName}:`, error);
-            return;
+client.on('interactionCreate', async i => {
+    if (i.isChatInputCommand()) {
+        console.log(`\n🖱️ INTERACTION: Command received: /${i.commandName} from ${i.user.tag}.`);
+        const cmd = client.commands.get(i.commandName);
+        if (cmd) {
+            console.log(`-> Executing command handler for /${i.commandName}.`);
+            return cmd.execute(i, applications, saveApplications);
         }
     }
 
-    const previousLevelRoles = guild.roles.cache.filter(r => 
-        r.name.startsWith('Level ') && r.name !== roleName
-    );
-
-    for (const [id, prevRole] of previousLevelRoles) {
-        if (member.roles.cache.has(id)) {
-            await member.roles.remove(prevRole).catch(console.error);
+    if (i.isButton()) {
+        const [action, userId] = i.customId.split('_');
+        console.log(`\n🖱️ INTERACTION: Button click received: "${action}" for user ID ${userId} by ${i.user.tag}.`);
+        
+        if (!i.member.permissions.has('Administrator')) {
+             console.log(`-> User ${i.user.tag} attempted button action without permission. Denied.`);
+             return i.reply({ content: 'Du har ikke tilladelse til at gøre dette.', ephemeral: true });
         }
-    }
 
-    if (!member.roles.cache.has(role.id)) {
-        await member.roles.add(role).catch(console.error);
-    }
-}
+        const guild = i.guild;
+        const member = await guild.members.fetch(userId).catch(() => null);
 
-client.commands = new Collection();
-const commands = [
-    {
-        name: 'leaderboard',
-        description: 'Viser de 10 bedste brugere baseret på level og point.',
-    },
-    {
-        name: 'info',
-        description: 'Viser information om DFDS botten.',
-    },
-];
+        if (!member) {
+            console.log(`-> Target user ${userId} not found in guild.`);
+            return i.reply({ content: 'Bruger ikke fundet.', ephemeral: true });
+        }
 
-async function registerSlashCommands() {
-    const rest = new REST({ version: '10' }).setToken(BOT_TOKEN);
-    
-    try {
-        console.log('Starter opdatering af (/) applikationskommandoer.');
-        
-        await rest.put(
-            Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID),
-            { body: commands },
-        );
-        
-        console.log('Alle (/) applikationskommandoer er indlæst.');
-    } catch (error) {
-        console.error(error);
-    }
-}
+        if (action === 'approve') {
+            console.log(`-> APPROVING application for ${member.user.tag}.`);
+            await member.roles.remove(PENDING_ROLE).catch(e => console.error('❌ Failed to remove PENDING_ROLE:', e.message));
+            await member.roles.add(MEMBER_ROLE).catch(e => console.error('❌ Failed to add MEMBER_ROLE:', e.message));
+            await member.send('Din ansøgning er godkendt!').catch(e => console.error('❌ Failed to send approval DM:', e.message));
+            
+            console.log(`✅ ${member.user.tag} approved and roles updated.`);
+            return i.reply({ content: `Godkendte ${member.user.tag}`, ephemeral: true });
+        }
 
-client.on('interactionCreate', async interaction => {
-    if (!interaction.isChatInputCommand()) return;
-
-    const { commandName } = interaction;
-
-    if (commandName === 'leaderboard') {
-        await handleLeaderboardCommand(interaction);
-    } else if (commandName === 'info') {
-        await handleInfoCommand(interaction);
+        if (action === 'deny') {
+            console.log(`-> DENYING application for ${member.user.tag}.`);
+            await member.send('Din ansøgning blev afvist.').catch(e => console.error('❌ Failed to send denial DM:', e.message));
+            
+            delete applications[userId];
+            saveApplications();
+            
+            await member.kick('Ansøgning afvist.').catch(e => console.error(`❌ Failed to kick ${member.user.tag}:`, e.message));
+            
+            console.log(`❌ ${member.user.tag} denied, application deleted, and user kicked.`);
+            return i.reply({ content: `Afviste ${member.user.tag}`, ephemeral: true });
+        }
     }
 });
 
-/**
- * @param {ChatInputCommandInteraction} interaction 
- */
-async function handleLeaderboardCommand(interaction) {
-    await interaction.deferReply();
-
-    const sortedUsers = Object.keys(levelData)
-        .map(id => ({ 
-            id: id, 
-            ...levelData[id] 
-        }))
-        .sort((a, b) => {
-            if (b.level !== a.level) {
-                return b.level - a.level;
-            }
-            return b.points - a.points;
-        })
-        .slice(0, 10);
-
-    let leaderboardText = '';
-    
-    if (sortedUsers.length === 0) {
-        leaderboardText = 'Der er endnu ingen på leaderboardet! Skriv en besked for at komme i gang.';
-    } else {
-        for (let i = 0; i < sortedUsers.length; i++) {
-            const user = sortedUsers[i];
-            const member = await interaction.guild.members.fetch(user.id).catch(() => null);
-            
-            const username = member ? member.user.tag : 'Ukendt bruger';
-            const rank = i + 1;
-            
-            leaderboardText += `**#${rank}** - **${username}**\nLevel: \`${user.level}\` | Point: \`${user.points}\`\n\n`;
-        }
-    }
-
-    const embed = new EmbedBuilder()
-        .setTitle('🏆 DFDS Level Leaderboard')
-        .setDescription(leaderboardText)
-        .setColor('#2ecc71')
-        .setTimestamp()
-        .setFooter({ text: 'Fortsæt med at chatte for at stige i niveau!' });
-
-    await interaction.editReply({ embeds: [embed] });
-}
-
-/**
- * @param {ChatInputCommandInteraction} interaction 
- */
-
-async function handleInfoCommand(interaction) {
-    const embed = new EmbedBuilder()
-        .setTitle('ℹ️ DFDS Bot Information')
-        .setDescription('Denne bot er udviklet til Den Frie Digitale Skole (DFDS) for at tilføje et sjovt level-system.')
-        .addFields(
-            { name: 'Funktioner', value: 'Level System (1 point pr. besked, 60s cooldown)\n/leaderboard kommando\nAutomatisk Level Rolle-tildeling', inline: true },
-            { name: 'Point System', value: 'Level 1: 10 Point\nLevel 2: 20 Point\nLevel 3: 40 Point\n... og så videre - pointene dobler for hvert level.', inline: true },
-        )
-        .setColor('#3498db')
-        .setFooter({ text: `Botten er online siden ${client.readyAt.toLocaleDateString()}` });
-
-    await interaction.reply({ embeds: [embed] });
-}
-
-client.login(BOT_TOKEN);
+console.log(`\n🚀 Attempting to log in with BOT_TOKEN...`);
+client.login(BOT_TOKEN).catch(error => {
+    // If the login fails, it catches the error here.
+    console.error('----------------------------------------------------');
+    console.error('❌ FATAL ERROR: FAILED TO LOG IN TO DISCORD!');
+    console.error('❌ Check your BOT_TOKEN in the .env file.');
+    console.error(`Error Message: ${error.message}`);
+    console.error('----------------------------------------------------');
+    process.exit(1); 
+});
