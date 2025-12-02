@@ -37,17 +37,26 @@ let applications = {};
 function loadApplications() {
     console.log(`⏳ Attempting to load application data from ${DATA_FILE}...`);
     if (fs.existsSync(DATA_FILE)) {
-        applications = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-        console.log(`✅ Application data loaded. Found ${Object.keys(applications).length} existing applications.`);
+        try {
+            const encodedData = fs.readFileSync(DATA_FILE, 'utf8');
+            const decodedData = Buffer.from(encodedData, 'base64').toString('utf8');
+            applications = JSON.parse(decodedData);
+            console.log(`✅ Application data loaded and decoded. Found ${Object.keys(applications).length} existing applications.`);
+        } catch (error) {
+            console.error('❌ ERROR loading or decoding application data. Starting with empty list.', error.message);
+            applications = {}; 
+        }
     } else {
         console.log(`⚠️ Data file ${DATA_FILE} not found. Starting with empty application list.`);
     }
 }
 
 function saveApplications() {
-    console.log('🔄 Saving application data to disk...');
-    fs.writeFileSync(DATA_FILE, JSON.stringify(applications, null, 2));
-    console.log('✅ Application data saved successfully.');
+    console.log('🔄 Encoding and saving application data to disk...');
+    const jsonString = JSON.stringify(applications, null, 2);
+    const encodedData = Buffer.from(jsonString).toString('base64');
+    fs.writeFileSync(DATA_FILE, encodedData);
+    console.log('✅ Application data encoded and saved successfully.');
 }
 
 function loadCommands() {
@@ -147,8 +156,8 @@ async function startApplication(member) {
                 const now = new Date().getFullYear() % 100;
 
                 if (year < 20 || year > now) {
-                     console.log(`-> ELEV Step 1 (Elevnummer) FAILED validation: Invalid year prefix (${year}).`);
-                     return member.send('Ugyldigt elevnummer.');
+                    console.log(`-> ELEV Step 1 (Elevnummer) FAILED validation: Invalid year prefix (${year}).`);
+                    return member.send('Ugyldigt elevnummer.');
                 }
 
                 answers.elevnummer = content;
